@@ -16,7 +16,6 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"github.com/smallnest/iprange"
 	"github.com/spf13/cobra"
 	"log"
 	"math/rand"
@@ -38,8 +37,9 @@ import (
 )
 
 var (
-	targetNic, ipMask     string
+	targetNic             string
 	securityGroups, ports []string
+	errQuit               = errors.New("quit")
 )
 
 func init() {
@@ -89,12 +89,20 @@ func setPortIngressSource(svc *ec2.EC2, name string, ports []string) error {
 	if err != nil {
 		return err
 	}
+	currentCidrIp := fmt.Sprintf("%s/32", strings.TrimSpace(string(ip)))
+
+	perms := []*ec2.IpPermission{}
 	for _, port := range ports {
+		alreadySet := false
+		portI := toInt(port)
 		for _, v := range grp.IpPermissions {
 			if strings.Contains(v.String(), port) {
+				if strings.Contains(currentCidrIp, *v.IpRanges[0].CidrIp) {
+					alreadySet = true
+					break
+				}
 				log.Println("Revoking", v.String())
 				// revoke
-				portI := toInt(port)
 				_, err := svc.RevokeSecurityGroupIngress(&ec2.RevokeSecurityGroupIngressInput{
 					GroupName:  aws.String(name),
 					IpProtocol: aws.String("tcp"),
@@ -110,17 +118,19 @@ func setPortIngressSource(svc *ec2.EC2, name string, ports []string) error {
 				}
 			}
 		}
+		if !alreadySet {
+			perms = append(perms, (&ec2.IpPermission{}).
+				SetIpProtocol("tcp").
+				SetFromPort(portI).
+				SetToPort(portI).
+				SetIpRanges([]*ec2.IpRange{
+					{CidrIp: aws.String(currentCidrIp)},
+				}))
+		}
 	}
-	perms := make([]*ec2.IpPermission, len(ports))
-	for i, v := range ports {
-		port := toInt(v)
-		perms[i] = (&ec2.IpPermission{}).
-			SetIpProtocol("tcp").
-			SetFromPort(port).
-			SetToPort(port).
-			SetIpRanges([]*ec2.IpRange{
-				{CidrIp: aws.String(fmt.Sprintf("%s/32", strings.TrimSpace(string(ip))))},
-			})
+	if len(perms) == 0 {
+		log.Println("all ingress ports are still valid")
+		return nil
 	}
 
 	_, err = svc.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
@@ -136,104 +146,95 @@ func setPortIngressSource(svc *ec2.EC2, name string, ports []string) error {
 	return nil
 }
 
-func getIfaceIp() (net.IP, bool) {
-	ifaces, err := net.Interfaces()
+func ifaceUp() bool {
+	iface, err := net.InterfaceByName(targetNic)
 	if err != nil {
 		log.Println(err.Error())
-		return nil, false
+		return false
 	}
-	ipMaskRange := iprange.ParseIPV4Range(ipMask)
-	for _, iface := range ifaces {
-		addrs, _ := iface.Addrs()
-		if strings.Contains(iface.Name, targetNic) {
-			for _, addr := range addrs {
-				ip := net.ParseIP(strings.Split(addr.String(), "/")[0])
-				if iprange.IPv4Contains(ipMaskRange, ip) {
-					// found valid ip
-					return ip, true
-				}
-			}
-			return nil, false
-		}
-	}
-	return nil, false
+	// log.Printf("%s addresses %v, flags: %v", iface.Name, addrs, iface.Flags)
+	return strings.Contains(iface.Flags.String(), "up")
 }
 
 func listenForIpChanges(quit chan bool) error {
 	sleep := 3 * time.Second
-	currentIp, ok := getIfaceIp()
+	ok := ifaceUp()
 	if !ok {
 		return errors.New("disconnected")
 	}
+	// _, err := getPublicIp()
+	// if err != nil {
+	// 	log.Println("unable to get public ip, possible disconnected")
+	// 	return err
+	// }
 	t := time.NewTicker(sleep)
-OUTER:
+	log.Println("listening for ip changes")
+	defer log.Println("stop listening for ip changes")
+	defer t.Stop()
+	// OUTER:
 	for {
 		select {
 		case <-quit:
-			break OUTER
+			return errQuit
 		case <-t.C:
-			nextIp, ok := getIfaceIp()
-			if ok {
-				if !currentIp.Equal(nextIp) {
-					// ip has changed, set security group
-					log.Println("ip has changed", currentIp, "=>", nextIp)
-					currentIp = nextIp
-					jitter := time.Duration(rand.Int63n(int64(sleep)))
-					sleep = sleep + jitter/2
-				} else {
-					// log.Println("ip is still the same", currentIp, "==", nextIp)
-					jitter := time.Duration(rand.Int63n(int64(sleep) + 40))
-					sleep = sleep + jitter/2
-				}
-				t.Stop()
-				t = time.NewTicker(sleep)
-
-			} else {
+			ok := ifaceUp()
+			if !ok {
+				log.Println("disconnected")
 				return errors.New("disconnected")
 			}
 		}
 	}
-	log.Println("stop watching")
 	return nil
 }
 
-func waitForReconnection(quit chan bool) (net.IP, error) {
-	sleep := 5 * time.Second
+func waitForReconnection(quit chan bool) ([]byte, error) {
+	sleep := 2 * time.Second
 	t := time.NewTicker(sleep)
-OUTER:
+	defer t.Stop()
+	log.Println("reconnecting...")
+	defer log.Println("stop waiting for reconnection")
+	// OUTER:
 	for {
 		select {
 		case <-quit:
-
-			break OUTER
+			return nil, errQuit
 		case <-t.C:
-			nextIp, ok := getIfaceIp()
-			if ok {
-				// ip has changed, set security group
-				log.Println("ip has been retrieved", nextIp)
-				return nextIp, nil
+			ip, err := getPublicIp()
+			if err == nil {
+				log.Println("reconnected as", string(ip))
+				return ip, nil
 
-			} else {
-				jitter := time.Duration(rand.Int63n(int64(sleep) + 40))
-				sleep = sleep + jitter/2
-				t.Stop()
-				t = time.NewTicker(sleep)
 			}
+			log.Println("reconnecting...")
+			//  else {
+			// 	jitter := time.Duration(rand.Int63n(int64(sleep)))
+			// 	sleep = sleep + jitter/2
+			// 	t.Stop()
+			// 	t = time.NewTicker(sleep)
+			// }
 		}
 	}
-	log.Println("stop waiting for reconnection")
+
 	return nil, nil
 }
 
 func watcher(svc *ec2.EC2, quit chan bool) error {
-	setPortIngressSource(svc, securityGroups[0], ports)
+	if err := setPortIngressSource(svc, securityGroups[0], ports); err != nil {
+		log.Println(err.Error())
+	}
 	if err := listenForIpChanges(quit); err != nil {
 		// we got disconnected wait for reconnection then listen again
-		log.Println("internet connection lost")
+		if err == errQuit {
+			return err
+		}
 		_, err = waitForReconnection(quit)
 		if err == nil {
 			return watcher(svc, quit)
 		}
+		if err == errQuit {
+			return nil
+		}
+		return err
 	}
 	return nil
 }
@@ -263,7 +264,9 @@ var watchCmd = &cobra.Command{
 		}))
 		svc := ec2.New(sess)
 		if err := watcher(svc, quit); err != nil {
-			log.Println("watcher failed", err.Error())
+			if err != errQuit {
+				log.Println("watcher failed", err.Error())
+			}
 		}
 	},
 }
@@ -280,8 +283,7 @@ func init() {
 	// Cobra supports local flags which will only run when this command
 	// is called directly, e.g.:
 	// watchCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
-	watchCmd.Flags().StringVarP(&targetNic, "interface", "i", "New Virtual Switch", "Interface to watch for changes")
-	watchCmd.Flags().StringVarP(&ipMask, "mask", "m", "192.168.1.1/24", "ip found has to match this mask")
+	watchCmd.Flags().StringVarP(&targetNic, "interface", "i", "vEthernet (New Virtual Switch)", "Interface to watch for changes")
 	watchCmd.Flags().StringArrayVarP(&securityGroups, "groups", "g", []string{"launch-wizard-1"}, "ec2 security groups to modify")
 	watchCmd.Flags().StringArrayVarP(&ports, "ports", "t", []string{"2376"}, "ports to modify")
 }
