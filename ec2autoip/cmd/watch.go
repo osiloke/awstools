@@ -52,7 +52,7 @@ func toInt(s string) int64 {
 }
 
 func getPublicIp() ([]byte, error) {
-	rsp, err := http.Get("http://checkip.amazonaws.com")
+	rsp, err := http.Get("https://ifconfig.co/")
 	if err != nil {
 		return nil, err
 	}
